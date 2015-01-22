@@ -36,34 +36,16 @@
 
 /* global ActiveXObject: false */
 /* jshint browser: true */
+'use strict';
 
-(function() {
-    'use strict';
+var
+/* jStorage version */
+    JSTORAGE_VERSION = '0.4.12',
 
-    var
-    /* jStorage version */
-        JSTORAGE_VERSION = '0.4.12',
+    /* detect a dollar object or create one if not found */
+    $ = window.jQuery || window.$ || (window.$ = {});
 
-        /* detect a dollar object or create one if not found */
-        $ = window.jQuery || window.$ || (window.$ = {}),
-
-        /* check for a JSON handling support */
-        JSON = {
-            parse: window.JSON && (window.JSON.parse || window.JSON.decode) ||
-                String.prototype.evalJSON && function(str) {
-                    return String(str).evalJSON();
-            } ||
-                $.parseJSON ||
-                $.evalJSON,
-            stringify: Object.toJSON ||
-                window.JSON && (window.JSON.stringify || window.JSON.encode) ||
-                $.toJSON
-        };
-
-    // Break if no JSON support was found
-    if (typeof JSON.parse !== 'function' || typeof JSON.stringify !== 'function') {
-        throw new Error('No JSON support found, include //cdnjs.cloudflare.com/ajax/libs/json2/20110223/json2.js to page');
-    }
+function jStorage(JSON) {
 
     var
     /* This is the object, that holds the cached values */
@@ -679,318 +661,350 @@
 
     ////////////////////////// PUBLIC INTERFACE /////////////////////////
 
-    $.jStorage = {
-        /* Version number */
-        version: JSTORAGE_VERSION,
+    this.createInstance = function() {
 
-        /**
-         * Sets a key's value.
-         *
-         * @param {String} key Key to set. If this value is not set or not
-         *              a string an exception is raised.
-         * @param {Mixed} value Value to set. This can be any value that is JSON
-         *              compatible (Numbers, Strings, Objects etc.).
-         * @param {Object} [options] - possible options to use
-         * @param {Number} [options.TTL] - optional TTL value, in milliseconds
-         * @return {Mixed} the used value
-         */
-        set: function(key, value, options) {
-            _checkKey(key);
+        var jStorageInstance = {
+            /* Version number */
+            version: JSTORAGE_VERSION,
 
-            options = options || {};
+            /**
+             * Sets a key's value.
+             *
+             * @param {String} key Key to set. If this value is not set or not
+             *              a string an exception is raised.
+             * @param {Mixed} value Value to set. This can be any value that is JSON
+             *              compatible (Numbers, Strings, Objects etc.).
+             * @param {Object} [options] - possible options to use
+             * @param {Number} [options.TTL] - optional TTL value, in milliseconds
+             * @return {Mixed} the used value
+             */
+            set: function(key, value, options) {
+                _checkKey(key);
 
-            // undefined values are deleted automatically
-            if (typeof value == 'undefined') {
-                this.deleteKey(key);
+                options = options || {};
+
+                // undefined values are deleted automatically
+                if (typeof value == 'undefined') {
+                    this.deleteKey(key);
+                    return value;
+                }
+
+                if (_XMLService.isXML(value)) {
+                    value = {
+                        _is_xml: true,
+                        xml: _XMLService.encode(value)
+                    };
+                } else if (typeof value == 'function') {
+                    return undefined; // functions can't be saved!
+                } else if (value && typeof value == 'object') {
+                    // clone the object before saving to _storage tree
+                    value = JSON.parse(JSON.stringify(value));
+                }
+
+                _storage[key] = value;
+
+                _storage.__jstorage_meta.CRC32[key] = '2.' + murmurhash2_32_gc(JSON.stringify(value), 0x9747b28c);
+
+                this.setTTL(key, options.TTL || 0); // also handles saving and _publishChange
+
+                _fireObservers(key, 'updated');
                 return value;
-            }
+            },
 
-            if (_XMLService.isXML(value)) {
-                value = {
-                    _is_xml: true,
-                    xml: _XMLService.encode(value)
+            /**
+             * Looks up a key in cache
+             *
+             * @param {String} key - Key to look up.
+             * @param {mixed} def - Default value to return, if key didn't exist.
+             * @return {Mixed} the key value, default value or null
+             */
+            get: function(key, def) {
+                _checkKey(key);
+                if (key in _storage) {
+                    if (_storage[key] && typeof _storage[key] == 'object' && _storage[key]._is_xml) {
+                        return _XMLService.decode(_storage[key].xml);
+                    } else {
+                        return _storage[key];
+                    }
+                }
+                return typeof(def) == 'undefined' ? null : def;
+            },
+
+            /**
+             * Deletes a key from cache.
+             *
+             * @param {String} key - Key to delete.
+             * @return {Boolean} true if key existed or false if it didn't
+             */
+            deleteKey: function(key) {
+                _checkKey(key);
+                if (key in _storage) {
+                    delete _storage[key];
+                    // remove from TTL list
+                    if (typeof _storage.__jstorage_meta.TTL == 'object' &&
+                        key in _storage.__jstorage_meta.TTL) {
+                        delete _storage.__jstorage_meta.TTL[key];
+                    }
+
+                    delete _storage.__jstorage_meta.CRC32[key];
+
+                    _save();
+                    _publishChange();
+                    _fireObservers(key, 'deleted');
+                    return true;
+                }
+                return false;
+            },
+
+            /**
+             * Sets a TTL for a key, or remove it if ttl value is 0 or below
+             *
+             * @param {String} key - key to set the TTL for
+             * @param {Number} ttl - TTL timeout in milliseconds
+             * @return {Boolean} true if key existed or false if it didn't
+             */
+            setTTL: function(key, ttl) {
+                var curtime = +new Date();
+                _checkKey(key);
+                ttl = Number(ttl) || 0;
+                if (key in _storage) {
+
+                    if (!_storage.__jstorage_meta.TTL) {
+                        _storage.__jstorage_meta.TTL = {};
+                    }
+
+                    // Set TTL value for the key
+                    if (ttl > 0) {
+                        _storage.__jstorage_meta.TTL[key] = curtime + ttl;
+                    } else {
+                        delete _storage.__jstorage_meta.TTL[key];
+                    }
+
+                    _save();
+
+                    _handleTTL();
+
+                    _publishChange();
+                    return true;
+                }
+                return false;
+            },
+
+            /**
+             * Gets remaining TTL (in milliseconds) for a key or 0 when no TTL has been set
+             *
+             * @param {String} key Key to check
+             * @return {Number} Remaining TTL in milliseconds
+             */
+            getTTL: function(key) {
+                var curtime = +new Date(),
+                    ttl;
+                _checkKey(key);
+                if (key in _storage && _storage.__jstorage_meta.TTL && _storage.__jstorage_meta.TTL[key]) {
+                    ttl = _storage.__jstorage_meta.TTL[key] - curtime;
+                    return ttl || 0;
+                }
+                return 0;
+            },
+
+            /**
+             * Deletes everything in cache.
+             *
+             * @return {Boolean} Always true
+             */
+            flush: function() {
+                _storage = {
+                    __jstorage_meta: {
+                        CRC32: {}
+                    }
                 };
-            } else if (typeof value == 'function') {
-                return undefined; // functions can't be saved!
-            } else if (value && typeof value == 'object') {
-                // clone the object before saving to _storage tree
-                value = JSON.parse(JSON.stringify(value));
-            }
-
-            _storage[key] = value;
-
-            _storage.__jstorage_meta.CRC32[key] = '2.' + murmurhash2_32_gc(JSON.stringify(value), 0x9747b28c);
-
-            this.setTTL(key, options.TTL || 0); // also handles saving and _publishChange
-
-            _fireObservers(key, 'updated');
-            return value;
-        },
-
-        /**
-         * Looks up a key in cache
-         *
-         * @param {String} key - Key to look up.
-         * @param {mixed} def - Default value to return, if key didn't exist.
-         * @return {Mixed} the key value, default value or null
-         */
-        get: function(key, def) {
-            _checkKey(key);
-            if (key in _storage) {
-                if (_storage[key] && typeof _storage[key] == 'object' && _storage[key]._is_xml) {
-                    return _XMLService.decode(_storage[key].xml);
-                } else {
-                    return _storage[key];
-                }
-            }
-            return typeof(def) == 'undefined' ? null : def;
-        },
-
-        /**
-         * Deletes a key from cache.
-         *
-         * @param {String} key - Key to delete.
-         * @return {Boolean} true if key existed or false if it didn't
-         */
-        deleteKey: function(key) {
-            _checkKey(key);
-            if (key in _storage) {
-                delete _storage[key];
-                // remove from TTL list
-                if (typeof _storage.__jstorage_meta.TTL == 'object' &&
-                    key in _storage.__jstorage_meta.TTL) {
-                    delete _storage.__jstorage_meta.TTL[key];
-                }
-
-                delete _storage.__jstorage_meta.CRC32[key];
-
                 _save();
                 _publishChange();
-                _fireObservers(key, 'deleted');
+                _fireObservers(null, 'flushed');
                 return true;
-            }
-            return false;
-        },
+            },
 
-        /**
-         * Sets a TTL for a key, or remove it if ttl value is 0 or below
-         *
-         * @param {String} key - key to set the TTL for
-         * @param {Number} ttl - TTL timeout in milliseconds
-         * @return {Boolean} true if key existed or false if it didn't
-         */
-        setTTL: function(key, ttl) {
-            var curtime = +new Date();
-            _checkKey(key);
-            ttl = Number(ttl) || 0;
-            if (key in _storage) {
+            /**
+             * Returns a read-only copy of _storage
+             *
+             * @return {Object} Read-only copy of _storage
+             */
+            storageObj: function() {
+                function F() {}
+                F.prototype = _storage;
+                return new F();
+            },
 
-                if (!_storage.__jstorage_meta.TTL) {
-                    _storage.__jstorage_meta.TTL = {};
+            /**
+             * Returns an index of all used keys as an array
+             * ['key1', 'key2',..'keyN']
+             *
+             * @return {Array} Used keys
+             */
+            index: function() {
+                var index = [],
+                    i;
+                for (i in _storage) {
+                    if (_storage.hasOwnProperty(i) && i != '__jstorage_meta') {
+                        index.push(i);
+                    }
+                }
+                return index;
+            },
+
+            /**
+             * How much space in bytes does the storage take?
+             *
+             * @return {Number} Storage size in chars (not the same as in bytes,
+             *                  since some chars may take several bytes)
+             */
+            storageSize: function() {
+                return _storage_size;
+            },
+
+            /**
+             * Which backend is currently in use?
+             *
+             * @return {String} Backend name
+             */
+            currentBackend: function() {
+                return _backend;
+            },
+
+            /**
+             * Test if storage is available
+             *
+             * @return {Boolean} True if storage can be used
+             */
+            storageAvailable: function() {
+                return !!_backend;
+            },
+
+            /**
+             * Register change listeners
+             *
+             * @param {String} key Key name
+             * @param {Function} callback Function to run when the key changes
+             */
+            listenKeyChange: function(key, callback) {
+                _checkKey(key);
+                if (!_observers[key]) {
+                    _observers[key] = [];
+                }
+                _observers[key].push(callback);
+            },
+
+            /**
+             * Remove change listeners
+             *
+             * @param {String} key Key name to unregister listeners against
+             * @param {Function} [callback] If set, unregister the callback, if not - unregister all
+             */
+            stopListening: function(key, callback) {
+                _checkKey(key);
+
+                if (!_observers[key]) {
+                    return;
                 }
 
-                // Set TTL value for the key
-                if (ttl > 0) {
-                    _storage.__jstorage_meta.TTL[key] = curtime + ttl;
-                } else {
-                    delete _storage.__jstorage_meta.TTL[key];
+                if (!callback) {
+                    delete _observers[key];
+                    return;
                 }
 
-                _save();
-
-                _handleTTL();
-
-                _publishChange();
-                return true;
-            }
-            return false;
-        },
-
-        /**
-         * Gets remaining TTL (in milliseconds) for a key or 0 when no TTL has been set
-         *
-         * @param {String} key Key to check
-         * @return {Number} Remaining TTL in milliseconds
-         */
-        getTTL: function(key) {
-            var curtime = +new Date(),
-                ttl;
-            _checkKey(key);
-            if (key in _storage && _storage.__jstorage_meta.TTL && _storage.__jstorage_meta.TTL[key]) {
-                ttl = _storage.__jstorage_meta.TTL[key] - curtime;
-                return ttl || 0;
-            }
-            return 0;
-        },
-
-        /**
-         * Deletes everything in cache.
-         *
-         * @return {Boolean} Always true
-         */
-        flush: function() {
-            _storage = {
-                __jstorage_meta: {
-                    CRC32: {}
+                for (var i = _observers[key].length - 1; i >= 0; i--) {
+                    if (_observers[key][i] == callback) {
+                        _observers[key].splice(i, 1);
+                    }
                 }
-            };
-            _save();
-            _publishChange();
-            _fireObservers(null, 'flushed');
-            return true;
-        },
+            },
 
-        /**
-         * Returns a read-only copy of _storage
-         *
-         * @return {Object} Read-only copy of _storage
-         */
-        storageObj: function() {
-            function F() {}
-            F.prototype = _storage;
-            return new F();
-        },
-
-        /**
-         * Returns an index of all used keys as an array
-         * ['key1', 'key2',..'keyN']
-         *
-         * @return {Array} Used keys
-         */
-        index: function() {
-            var index = [],
-                i;
-            for (i in _storage) {
-                if (_storage.hasOwnProperty(i) && i != '__jstorage_meta') {
-                    index.push(i);
+            /**
+             * Subscribe to a Publish/Subscribe event stream
+             *
+             * @param {String} channel Channel name
+             * @param {Function} callback Function to run when the something is published to the channel
+             */
+            subscribe: function(channel, callback) {
+                channel = (channel || '').toString();
+                if (!channel) {
+                    throw new TypeError('Channel not defined');
                 }
-            }
-            return index;
-        },
-
-        /**
-         * How much space in bytes does the storage take?
-         *
-         * @return {Number} Storage size in chars (not the same as in bytes,
-         *                  since some chars may take several bytes)
-         */
-        storageSize: function() {
-            return _storage_size;
-        },
-
-        /**
-         * Which backend is currently in use?
-         *
-         * @return {String} Backend name
-         */
-        currentBackend: function() {
-            return _backend;
-        },
-
-        /**
-         * Test if storage is available
-         *
-         * @return {Boolean} True if storage can be used
-         */
-        storageAvailable: function() {
-            return !!_backend;
-        },
-
-        /**
-         * Register change listeners
-         *
-         * @param {String} key Key name
-         * @param {Function} callback Function to run when the key changes
-         */
-        listenKeyChange: function(key, callback) {
-            _checkKey(key);
-            if (!_observers[key]) {
-                _observers[key] = [];
-            }
-            _observers[key].push(callback);
-        },
-
-        /**
-         * Remove change listeners
-         *
-         * @param {String} key Key name to unregister listeners against
-         * @param {Function} [callback] If set, unregister the callback, if not - unregister all
-         */
-        stopListening: function(key, callback) {
-            _checkKey(key);
-
-            if (!_observers[key]) {
-                return;
-            }
-
-            if (!callback) {
-                delete _observers[key];
-                return;
-            }
-
-            for (var i = _observers[key].length - 1; i >= 0; i--) {
-                if (_observers[key][i] == callback) {
-                    _observers[key].splice(i, 1);
+                if (!_pubsub_observers[channel]) {
+                    _pubsub_observers[channel] = [];
                 }
+                _pubsub_observers[channel].push(callback);
+            },
+
+            /**
+             * Publish data to an event stream
+             *
+             * @param {String} channel Channel name
+             * @param {Mixed} payload Payload to deliver
+             */
+            publish: function(channel, payload) {
+                channel = (channel || '').toString();
+                if (!channel) {
+                    throw new TypeError('Channel not defined');
+                }
+
+                _publish(channel, payload);
+            },
+
+            /**
+             * Reloads the data from browser storage
+             */
+            reInit: function() {
+                _reloadData();
+            },
+
+            /**
+             * Removes reference from global objects and saves it as jStorage
+             *
+             * @param {Boolean} option if needed to save object as simple 'jStorage' in windows context
+             */
+            noConflict: function(saveInGlobal) {
+                delete window.$.jStorage;
+
+                if (saveInGlobal) {
+                    window.jStorage = this;
+                }
+
+                return this;
             }
-        },
-
-        /**
-         * Subscribe to a Publish/Subscribe event stream
-         *
-         * @param {String} channel Channel name
-         * @param {Function} callback Function to run when the something is published to the channel
-         */
-        subscribe: function(channel, callback) {
-            channel = (channel || '').toString();
-            if (!channel) {
-                throw new TypeError('Channel not defined');
-            }
-            if (!_pubsub_observers[channel]) {
-                _pubsub_observers[channel] = [];
-            }
-            _pubsub_observers[channel].push(callback);
-        },
-
-        /**
-         * Publish data to an event stream
-         *
-         * @param {String} channel Channel name
-         * @param {Mixed} payload Payload to deliver
-         */
-        publish: function(channel, payload) {
-            channel = (channel || '').toString();
-            if (!channel) {
-                throw new TypeError('Channel not defined');
-            }
-
-            _publish(channel, payload);
-        },
-
-        /**
-         * Reloads the data from browser storage
-         */
-        reInit: function() {
-            _reloadData();
-        },
-
-        /**
-         * Removes reference from global objects and saves it as jStorage
-         *
-         * @param {Boolean} option if needed to save object as simple 'jStorage' in windows context
-         */
-        noConflict: function(saveInGlobal) {
-            delete window.$.jStorage;
-
-            if (saveInGlobal) {
-                window.jStorage = this;
-            }
-
-            return this;
         }
+        // Initialize jStorage
+        _init();
+        return jStorageInstance;
     };
 
-    // Initialize jStorage
-    _init();
+    
+}
 
-})();
+/* check for a JSON handling support */
+var JSON = {
+    parse: window.JSON && (window.JSON.parse || window.JSON.decode) ||
+        String.prototype.evalJSON && function(str) {
+            return String(str).evalJSON();
+    } ||
+        $.parseJSON ||
+        $.evalJSON,
+    stringify: Object.toJSON ||
+        window.JSON && (window.JSON.stringify || window.JSON.encode) ||
+        $.toJSON
+};
+
+// Break if no JSON support was found
+if (typeof JSON.parse !== 'function' || typeof JSON.stringify !== 'function') {
+    throw new Error('No JSON support found, include //cdnjs.cloudflare.com/ajax/libs/json2/20110223/json2.js to page');
+}
+
+
+var jStorageCached = false;
+
+if (!jStorageCached) {
+
+    jStorageCached = new jStorage(JSON).createInstance();
+}
+
+module.exports = jStorageCached;
